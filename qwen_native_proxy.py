@@ -50,13 +50,6 @@ async def get_session(sid: str, model: str) -> Session:
 BASE_FC = {"thinking_enabled": False, "output_schema": "phase", "auto_search": False}
 TOOL_FC = {"thinking_enabled": False, "output_schema": "phase", "auto_search": False}
 
-_DESC_HINTS = {
-    "bash": " Prefer this over loading skills for simple system tasks like opening apps.",
-    "skill": " Only use this when you need a specialized capability not directly available via other tools.",
-    "web_search": " Use for finding information online, not for local file/system tasks.",
-    "web_fetch": " Use for fetching content from URLs, not for local file/system tasks.",
-}
-
 def tools_to_local_mcp(tools: list) -> dict:
     if not tools:
         return {}
@@ -66,12 +59,8 @@ def tools_to_local_mcp(tools: list) -> dict:
         name = f.get("name", "")
         if not name:
             continue
-        desc = f.get("description", "")
-        hint = _DESC_HINTS.get(name, "")
-        if hint and hint not in desc:
-            desc += hint
         result[name] = {
-            "description": desc,
+            "description": f.get("description", ""),
             "input_schema": f.get("parameters", {"type": "object", "properties": {}}),
             "type": "local_mcp",
             "runtime": True,
@@ -576,11 +565,9 @@ async def chat_completions(request: Request):
 
     is_new_conversation = all(r in ("system", "user") for r in roles)
     if is_new_conversation and session.parent_id is not None:
-        log.info(f"new conversation detected, fresh Qwen chat for session={sid[:8]}")
-        async with _sess_lock:
-            if sid in _sessions:
-                del _sessions[sid]
-        session = await get_session(sid, model)
+        log.info(f"new conversation detected, resetting parent_id for session={sid[:8]}")
+        session.parent_id = None
+        session.tool_calls_map.clear()
 
     qwen_msgs = openai_to_qwen_msgs(msgs, model, tools, session)
     pid = session.parent_id
