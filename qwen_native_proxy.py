@@ -16,8 +16,10 @@ QWEN_TOKEN = os.environ.get("QWEN_TOKEN", "")
 QWEN_HEADERS = {
     "Authorization": f"Bearer {QWEN_TOKEN}",
     "Content-Type": "application/json",
-    "Origin": "https://qwen.ai",
-    "Referer": "https://qwen.ai/",
+    "Origin": "https://chat.qwen.ai",
+    "Referer": "https://chat.qwen.ai/",
+    "Accept": "text/event-stream, application/json",
+    "Accept-Language": "en-US,en;q=0.9",
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
 }
 
@@ -48,18 +50,6 @@ async def get_session(sid: str, model: str) -> Session:
 BASE_FC = {"thinking_enabled": False, "output_schema": "phase", "auto_search": False}
 TOOL_FC = {"thinking_enabled": False, "output_schema": "phase", "auto_search": False}
 
-def _check_qwen_error(raw: str):
-    if raw.startswith("{"):
-        try:
-            d = json.loads(raw)
-            if not d.get("success", True):
-                code = d.get("data", {}).get("code", "unknown")
-                msg = d.get("data", {}).get("message", d.get("message", ""))
-                return f"[Qwen API Error: {code}] {msg}"
-        except (json.JSONDecodeError, AttributeError):
-            pass
-    return None
-
 def tools_to_local_mcp(tools: list) -> dict:
     if not tools:
         return {}
@@ -76,6 +66,18 @@ def tools_to_local_mcp(tools: list) -> dict:
             "runtime": True,
         }
     return {"opencode_tools": result} if result else {}
+
+def _check_qwen_error(raw: str) -> Optional[str]:
+    if raw.startswith("{"):
+        try:
+            d = json.loads(raw)
+            if not d.get("success", True):
+                code = d.get("data", {}).get("code", "unknown")
+                msg = d.get("data", {}).get("message", d.get("message", ""))
+                return f"[Qwen API Error: {code}] {msg}"
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return None
 
 def parse_qwen_delta(data: dict, buffer: dict) -> dict:
     out = {"finish_reason": None, "tool_calls": None}
@@ -151,55 +153,6 @@ def parse_qwen_delta(data: dict, buffer: dict) -> dict:
 
     if tokens:
         out["content"] = tokens
-
-    return out
-
-    if phase == "think":
-        buffer["think"] = True
-        if tokens:
-            out["content"] = tokens
-        return out
-
-    if phase == "local_tool":
-        status = delta.get("status", "") or extra.get("status", "")
-        mcp_name = delta.get("mcp_name", "") or extra.get("mcp_name", "")
-        t_name = delta.get("tool_name", "") or extra.get("tool_name", "")
-        params_json = delta.get("params", "{}") or extra.get("params", "{}")
-
-        if status == "typing":
-            tid = f"call_{hashlib.sha256(f'{mcp_name}:{t_name}'.encode()).hexdigest()[:16]}"
-            buffer.update({"id": tid, "name": t_name, "phase": "typing", "mcp_server": mcp_name})
-            out["tool_calls"] = [{
-                "index": 0, "id": tid, "type": "function",
-                "function": {"name": t_name, "arguments": ""},
-            }]
-            return out
-
-        if status == "finished":
-            if buffer.get("phase") == "typing":
-                buffer["phase"] = "done"
-                t_name = buffer.get("name", t_name)
-                mcp_server = buffer.get("mcp_server", mcp_name)
-                tid = buffer.get("id", f"call_{hashlib.sha256(f'{mcp_server}:{t_name}'.encode()).hexdigest()[:16]}")
-                args_str = params_json if isinstance(params_json, str) else json.dumps(params_json)
-                try:
-                    json.loads(args_str)
-                except (json.JSONDecodeError, TypeError):
-                    args_str = "{}"
-                out["tool_calls"] = [{
-                    "index": 0, "id": tid, "type": "function",
-                    "function": {"name": t_name, "arguments": args_str},
-                }]
-                out["finish_reason"] = "tool_calls"
-                out["done"] = True
-            return out
-
-    if phase == "usage":
-        return {"usage": delta.get("extra", {}).get("usage", {})}
-
-    if phase == "search_queries":
-        out["content"] = ""
-        return out
 
     return out
 
@@ -601,7 +554,33 @@ async def chat_completions(request: Request):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    result = await non_stream_qwen(session.chat_id, model, qwen_msgs, pid, model, session)
+    is_first_turn = not session.parent_id and not has_tool_result and bool(tools)
+    is_subsequent = bool(session.parent_id) and not has_tool_result and bool(tools)
+
+    for attempt in range(3 if is_subsequent else (2 if is_first_turn else 1)):
+        if attempt == 1:
+            log.info(f"retry level 2: reset parentId (attempt {attempt + 1})")
+            session.parent_id = None
+            session.tool_calls_map.clear()
+            qwen_msgs = openai_to_qwen_msgs(msgs, model, tools, session)
+            pid = session.parent_id
+        elif attempt == 2:
+            log.info(f"retry level 3: new chat session (attempt {attempt + 1})")
+            async with _sess_lock:
+                if sid in _sessions:
+                    del _sessions[sid]
+            session = await get_session(sid, model)
+            qwen_msgs = openai_to_qwen_msgs(msgs, model, tools, session)
+            pid = session.parent_id
+
+        result = await non_stream_qwen(session.chat_id, model, qwen_msgs, pid, model, session)
+
+        msg0 = result.get("choices", [{}])[0].get("message", {})
+        if msg0.get("content") or msg0.get("tool_calls"):
+            break
+
+        log.info(f"attempt {attempt + 1} empty, retrying...")
+
     return JSONResponse(result)
 
 @app.get("/health")
